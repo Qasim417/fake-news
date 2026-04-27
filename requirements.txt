@@ -1,3 +1,4 @@
+tavily-python
 streamlit
 groq
 PyPDF2
