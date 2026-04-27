@@ -6,6 +6,7 @@ from io import BytesIO
 import PyPDF2
 import streamlit as st
 from groq import Groq
+from tavily import TavilyClient
 
 # =========================
 # PAGE CONFIG
@@ -107,25 +108,27 @@ st.markdown(
 )
 
 # =========================
-# SECRETS / API KEY
+# SECRETS / API KEYS
 # =========================
-def get_api_key() -> str:
-    if "GROQ_API_KEY" in st.secrets:
-        return st.secrets["GROQ_API_KEY"]
-    return os.getenv("GROQ_API_KEY", "")
+def get_secret(name: str) -> str:
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, "")
 
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 
-API_KEY = get_api_key()
-
-if not API_KEY:
-    st.error(
-        "GROQ_API_KEY missing. Add it in `.streamlit/secrets.toml` or Streamlit Cloud Secrets."
-    )
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY missing. Add it in Streamlit Secrets.")
     st.stop()
 
-client = Groq(api_key=API_KEY)
+if not TAVILY_API_KEY:
+    st.error("TAVILY_API_KEY missing. Add it in Streamlit Secrets.")
+    st.stop()
 
-# Updated Groq production model
+client = Groq(api_key=GROQ_API_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 # =========================
@@ -158,40 +161,8 @@ def read_uploaded_file(uploaded_file) -> str:
 
     return ""
 
-def build_prompt(news_text: str, source_url: str, detected_urls: list[str]) -> str:
-    return f"""
-You are a careful fake-news analysis assistant.
-
-Task:
-- Classify the input as exactly one of: Real, Fake, Unverified
-- Give a confidence score from 0 to 100
-- Explain in simple English
-- Mention suspicious claims if any
-- Mention source notes based only on provided input
-- If there is not enough evidence, say Unverified
-- Do NOT pretend you checked the live web unless a real source URL is provided in the input
-- Keep the response concise and useful
-
-Return VALID JSON only with these keys:
-- verdict (string)
-- confidence (integer)
-- explanation (string)
-- suspicious_claims (array of strings)
-- source_notes (array of strings)
-- final_note (string)
-
-Input text:
-{news_text[:12000]}
-
-User-provided source URL:
-{source_url if source_url else "None"}
-
-URLs detected inside the provided content:
-{detected_urls if detected_urls else "None"}
-""".strip()
-
 def safe_parse_json(text: str):
-    text = text.strip()
+    text = (text or "").strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
     candidate = match.group(0) if match else text
     candidate = candidate.strip().strip("```").replace("json", "", 1).strip()
@@ -200,61 +171,189 @@ def safe_parse_json(text: str):
     except Exception:
         return None
 
-def analyze_news(news_text: str, source_url: str):
-    news_text = clean_text(news_text)
-    detected_urls = extract_urls(news_text)
+def groq_json(prompt: str, system_msg: str):
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+    )
+    raw = response.choices[0].message.content.strip()
+    data = safe_parse_json(raw)
+    return data, raw
 
-    prompt = build_prompt(news_text, source_url, detected_urls)
+def extract_claims(article_text: str):
+    prompt = f"""
+Extract up to 3 key factual claims from the news text below.
+For each claim, create a short web search query.
 
+Return VALID JSON only in this format:
+{{
+  "claims": [
+    {{"claim": "short claim", "query": "search query"}},
+    {{"claim": "short claim", "query": "search query"}}
+  ]
+}}
+
+Rules:
+- Keep claims short.
+- Search query should be concise and factual.
+- If text is weak or short, still return the best possible claims.
+- Return JSON only.
+
+News text:
+{article_text[:7000]}
+""".strip()
+
+    data, raw = groq_json(
+        prompt,
+        "You are a JSON-only assistant that extracts factual claims.",
+    )
+
+    if not data or "claims" not in data:
+        fallback = article_text[:250].strip()
+        return [{"claim": fallback, "query": fallback}], raw
+
+    claims = []
+    for item in data.get("claims", [])[:3]:
+        claim = str(item.get("claim", "")).strip()
+        query = str(item.get("query", claim)).strip()
+        if claim:
+            claims.append({"claim": claim, "query": query[:300] or claim[:300]})
+
+    if not claims:
+        fallback = article_text[:250].strip()
+        claims = [{"claim": fallback, "query": fallback}]
+
+    return claims, raw
+
+def search_web_for_claim(query: str):
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
+        res = tavily_client.search(query=query)
+        return res if isinstance(res, dict) else {}
+    except Exception as e:
+        return {"error": str(e), "results": []}
+
+def gather_evidence(claims):
+    evidence = []
+    source_links = []
+
+    for c in claims:
+        query = c["query"]
+        search_res = search_web_for_claim(query)
+        results = search_res.get("results", []) or []
+
+        items = []
+        for r in results[:3]:
+            title = r.get("title", "")
+            url = r.get("url", "")
+            snippet = r.get("content", "") or r.get("snippet", "")
+            if url:
+                source_links.append(url)
+            items.append(
                 {
-                    "role": "system",
-                    "content": "You are a precise fact-checking assistant that responds in valid JSON only.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet[:300],
+                }
+            )
+
+        evidence.append(
+            {
+                "claim": c["claim"],
+                "query": query,
+                "answer": search_res.get("answer", ""),
+                "items": items,
+            }
         )
 
-        raw = response.choices[0].message.content.strip()
-        data = safe_parse_json(raw)
+    unique_links = list(dict.fromkeys([u for u in source_links if u]))
+    return evidence, unique_links
 
-        if not data:
-            data = {
-                "verdict": "Unverified",
-                "confidence": 50,
-                "explanation": raw,
-                "suspicious_claims": [],
-                "source_notes": [],
-                "final_note": "The model returned non-JSON output, so the app showed the raw answer.",
-            }
+def final_assessment(article_text: str, source_url: str, claims, evidence):
+    evidence_block = []
+    for idx, block in enumerate(evidence, start=1):
+        evidence_block.append(f"Claim {idx}: {block['claim']}")
+        evidence_block.append(f"Search query: {block['query']}")
+        if block.get("answer"):
+            evidence_block.append(f"Search answer: {block['answer']}")
+        for src in block.get("items", []):
+            evidence_block.append(
+                f"- Source: {src['title']} | {src['url']} | Snippet: {src['snippet']}"
+            )
+        evidence_block.append("")
 
-        data.setdefault("verdict", "Unverified")
-        data.setdefault("confidence", 50)
-        data.setdefault("explanation", "")
-        data.setdefault("suspicious_claims", [])
-        data.setdefault("source_notes", [])
-        data.setdefault("final_note", "")
+    prompt = f"""
+You are a careful fact-checking assistant.
 
-        try:
-            data["confidence"] = max(0, min(100, int(data["confidence"])))
-        except Exception:
-            data["confidence"] = 50
+Decide whether the news is:
+- Real
+- Fake
+- Unverified
 
-        return data, detected_urls, raw
+Use ONLY the article text and the search evidence below.
 
-    except Exception as e:
-        return {
+Return VALID JSON only with:
+{{
+  "verdict": "Real/Fake/Unverified",
+  "confidence": 0-100,
+  "explanation": "simple English explanation",
+  "suspicious_claims": ["..."],
+  "source_notes": ["..."],
+  "final_note": "short closing note"
+}}
+
+Rules:
+- If evidence supports the main claim, mark Real.
+- If evidence contradicts the main claim, mark Fake.
+- If evidence is weak, mixed, or missing, mark Unverified.
+- Mention source URLs in source_notes.
+- Keep explanation short but useful.
+- Do not invent sources.
+
+Article text:
+{article_text[:9000]}
+
+Optional user source URL:
+{source_url if source_url else "None"}
+
+Claims:
+{json.dumps(claims, ensure_ascii=False)}
+
+Search evidence:
+{chr(10).join(evidence_block)}
+""".strip()
+
+    data, raw = groq_json(
+        prompt,
+        "You are a JSON-only fact-checking assistant.",
+    )
+
+    if not data:
+        data = {
             "verdict": "Unverified",
-            "confidence": 0,
-            "explanation": f"Groq error: {e}",
+            "confidence": 40,
+            "explanation": raw or "No structured response returned.",
             "suspicious_claims": [],
             "source_notes": [],
-            "final_note": "The request could not be completed.",
-        }, detected_urls, ""
+            "final_note": "The model did not return valid JSON.",
+        }
+
+    data.setdefault("verdict", "Unverified")
+    data.setdefault("confidence", 50)
+    data.setdefault("explanation", "")
+    data.setdefault("suspicious_claims", [])
+    data.setdefault("source_notes", [])
+    data.setdefault("final_note", "")
+
+    try:
+        data["confidence"] = max(0, min(100, int(data["confidence"])))
+    except Exception:
+        data["confidence"] = 50
+
+    return data, raw
 
 def verdict_badge(verdict: str):
     v = (verdict or "").lower()
@@ -264,10 +363,7 @@ def verdict_badge(verdict: str):
         return '<span class="badge badge-fake">FAKE</span>'
     return '<span class="badge badge-unknown">UNVERIFIED</span>'
 
-def make_report(data: dict, source_url: str, detected_urls: list[str], input_excerpt: str):
-    suspicious = data.get("suspicious_claims", []) or []
-    sources = data.get("source_notes", []) or []
-
+def make_report(data: dict, source_url: str, evidence, input_excerpt: str):
     lines = []
     lines.append("# AI Fake News Detector Report")
     lines.append(f"- Verdict: {data.get('verdict', 'Unverified')}")
@@ -277,6 +373,7 @@ def make_report(data: dict, source_url: str, detected_urls: list[str], input_exc
     lines.append(str(data.get("explanation", "")))
     lines.append("")
     lines.append("## Suspicious Claims")
+    suspicious = data.get("suspicious_claims", []) or []
     if suspicious:
         for item in suspicious:
             lines.append(f"- {item}")
@@ -284,28 +381,31 @@ def make_report(data: dict, source_url: str, detected_urls: list[str], input_exc
         lines.append("- None detected")
     lines.append("")
     lines.append("## Source Notes")
-    if sources:
-        for item in sources:
+    source_notes = data.get("source_notes", []) or []
+    if source_notes:
+        for item in source_notes:
             lines.append(f"- {item}")
     else:
-        lines.append("- No extra source notes returned")
+        lines.append("- No source notes returned")
     lines.append("")
-    lines.append("## Source URL")
+    lines.append("## Optional User Source URL")
     lines.append(source_url if source_url else "Not provided")
     lines.append("")
-    lines.append("## URLs Detected in Input")
-    if detected_urls:
-        for u in detected_urls:
-            lines.append(f"- {u}")
-    else:
-        lines.append("- None detected")
+    lines.append("## Web Evidence")
+    for idx, block in enumerate(evidence, start=1):
+        lines.append(f"### Claim {idx}")
+        lines.append(f"- Claim: {block['claim']}")
+        lines.append(f"- Query: {block['query']}")
+        if block.get("answer"):
+            lines.append(f"- Search answer: {block['answer']}")
+        for src in block.get("items", []):
+            lines.append(f"- Source: {src['title']} | {src['url']}")
     lines.append("")
     lines.append("## Input Excerpt")
     lines.append(input_excerpt[:2000])
     lines.append("")
     lines.append("## Final Note")
     lines.append(str(data.get("final_note", "")))
-
     return "\n".join(lines)
 
 # =========================
@@ -314,9 +414,9 @@ def make_report(data: dict, source_url: str, detected_urls: list[str], input_exc
 with st.sidebar:
     st.title("⚙️ Settings")
     source_url = st.text_input(
-        "Source URL (optional)",
-        placeholder="Paste the article link here",
-        help="This will be shown in the report and used as a source hint.",
+        "Article URL (optional)",
+        placeholder="Paste the news link here",
+        help="Optional: if you have the article link, add it here.",
     )
     show_raw = st.checkbox("Show raw AI output", value=False)
     max_chars = st.slider("Max characters sent to AI", 1000, 12000, 6000, 500)
@@ -328,7 +428,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>📰 AI Fake News Detector</h1>
-        <p>Paste news text or upload a PDF/TXT file, then get a verdict, confidence score, explanation, suspicious claims, and source notes.</p>
+        <p>Paste news text or upload a PDF/TXT file. The app checks claims with web search and then uses Groq to decide Real, Fake, or Unverified.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -365,7 +465,7 @@ with col2:
     st.write("• Confidence score")
     st.write("• Simple explanation")
     st.write("• Suspicious claims list")
-    st.write("• Source notes and detected URLs")
+    st.write("• Web sources from Tavily")
     st.write("• Downloadable report")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -385,10 +485,14 @@ if analyze_btn:
     if not combined_text.strip():
         st.warning("Please paste some news text or upload a PDF/TXT file.")
     else:
-        with st.spinner("Analyzing with Groq..."):
-            data, detected_urls, raw = analyze_news(
-                combined_text[:max_chars],
-                source_url.strip(),
+        with st.spinner("Checking claims with Tavily and Groq..."):
+            claims, claims_raw = extract_claims(combined_text[:max_chars])
+            evidence, unique_sources = gather_evidence(claims)
+            data, raw = final_assessment(
+                article_text=combined_text[:max_chars],
+                source_url=source_url.strip(),
+                claims=claims,
+                evidence=evidence,
             )
 
         verdict = data.get("verdict", "Unverified")
@@ -407,7 +511,7 @@ if analyze_btn:
         top1, top2, top3 = st.columns(3)
         top1.metric("Verdict", verdict)
         top2.metric("Confidence", f"{confidence}%")
-        top3.metric("Detected URLs", len(detected_urls))
+        top3.metric("Sources found", len(unique_sources))
 
         st.progress(confidence / 100.0)
 
@@ -428,20 +532,27 @@ if analyze_btn:
             for item in source_notes:
                 st.write(f"• {item}")
         else:
-            st.info("No additional source notes were returned.")
+            st.info("No source notes were returned.")
 
-        st.markdown("### Source Links")
-        source_link_items = []
-        if source_url.strip():
-            source_link_items.append(source_url.strip())
-        source_link_items.extend(detected_urls)
-
-        if source_link_items:
-            unique_links = list(dict.fromkeys(source_link_items))
-            for link in unique_links:
+        st.markdown("### Web Sources")
+        if unique_sources:
+            for link in unique_sources:
                 st.markdown(f"- {link}")
         else:
-            st.warning("No source link found in the input. Add a source URL for a stronger report.")
+            st.warning("No web sources were found for the claims.")
+
+        with st.expander("Show claim-by-claim evidence"):
+            for idx, block in enumerate(evidence, start=1):
+                st.markdown(f"**Claim {idx}:** {block['claim']}")
+                st.markdown(f"**Query:** {block['query']}")
+                if block.get("answer"):
+                    st.markdown(f"**Search answer:** {block['answer']}")
+                if block.get("items"):
+                    for src in block["items"]:
+                        st.markdown(
+                            f"- **{src['title']}**  \n  {src['url']}  \n  {src['snippet']}"
+                        )
+                st.divider()
 
         st.markdown("### Final Note")
         st.write(data.get("final_note", ""))
@@ -449,7 +560,7 @@ if analyze_btn:
         report = make_report(
             data=data,
             source_url=source_url.strip(),
-            detected_urls=detected_urls,
+            evidence=evidence,
             input_excerpt=combined_text[:max_chars],
         )
 
@@ -461,7 +572,7 @@ if analyze_btn:
             use_container_width=True,
         )
 
-        if show_raw and raw:
+        if show_raw:
             st.markdown("### Raw AI Output")
             st.code(raw, language="json")
 
